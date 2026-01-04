@@ -1,17 +1,24 @@
-"""Enhanced Streamlit Dashboard for Crypto Market Monitoring."""
+"""Enhanced Streamlit Dashboard for Crypto Market Monitoring (Monolith Mode)."""
+import sys
+import os
+
+# Add parent directory to path to allow importing 'app'
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import io
 import base64
 
-# Configuration
-API_BASE_URL = "http://localhost:8000/api"
+# Backend Imports
+from app.core.streamlit_utils import initialize_backend, run_async, get_db_session
+from app.db import crud
+from app.services.anomaly import detect_anomalies, calculate_volatility
 
 st.set_page_config(
     page_title="Crypto Market Dashboard",
@@ -19,6 +26,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Initialize Backend (DB & Scheduler)
+initialize_backend()
 
 # Custom CSS for premium look
 st.markdown("""
@@ -118,84 +128,143 @@ def get_chart_download_button(fig: go.Figure, filename: str, key: str):
     )
 
 
-# ============== API Functions ==============
+# ============== Data Fetching Functions (Monolith) ==============
 
 @st.cache_data(ttl=60)
 def fetch_assets() -> List[Dict]:
-    """Fetch available assets from API."""
-    try:
-        response = requests.get(f"{API_BASE_URL}/assets", timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        st.error(f"Failed to fetch assets: {e}")
-        return []
+    """Fetch available assets directly from DB."""
+    async def _fetch():
+        async with get_db_session() as session:
+            assets = await crud.get_all_assets(session)
+            return [
+                {
+                    "id": a.id,
+                    "symbol": a.symbol,
+                    "name": a.name,
+                    "coingecko_id": a.coingecko_id
+                }
+                for a in assets
+            ]
+    return run_async(_fetch())
 
 
 @st.cache_data(ttl=60)
-def fetch_prices(asset: str, from_date: str = None, to_date: str = None) -> Optional[Dict]:
-    """Fetch price history for an asset."""
-    try:
-        params = {"asset": asset}
-        if from_date:
-            params["from"] = from_date
-        if to_date:
-            params["to"] = to_date
-        
-        response = requests.get(f"{API_BASE_URL}/prices", params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        st.error(f"Failed to fetch prices: {e}")
-        return None
+def fetch_prices(asset_symbol: str, from_date: str = None, to_date: str = None) -> Optional[Dict]:
+    """Fetch price history directly from DB."""
+    async def _fetch():
+        async with get_db_session() as session:
+            # Get asset info
+            asset = await crud.get_asset_by_symbol(session, asset_symbol)
+            if not asset:
+                return None
+            
+            # Parse dates
+            from_dt = datetime.fromisoformat(from_date) if from_date else None
+            to_dt = datetime.fromisoformat(to_date) if to_date else None
+            
+            snapshots = await crud.get_snapshots_by_asset(session, asset.id, from_dt, to_dt)
+            
+            return {
+                "asset": {
+                    "id": asset.id,
+                    "symbol": asset.symbol,
+                    "name": asset.name,
+                    "coingecko_id": asset.coingecko_id
+                },
+                "prices": [
+                    {
+                        "timestamp": s.timestamp.isoformat(),
+                        "price_usd": float(s.price_usd),
+                        "volume_24h": float(s.volume_24h) if s.volume_24h else None,
+                        "market_cap": float(s.market_cap) if s.market_cap else None,
+                        "price_change_24h": float(s.price_change_24h) if s.price_change_24h else None,
+                    }
+                    for s in snapshots
+                ]
+            }
+    return run_async(_fetch())
 
 
 @st.cache_data(ttl=60)
-def fetch_comparison(assets: str, normalize: bool = False, from_date: str = None) -> Optional[Dict]:
-    """Fetch comparison data for multiple assets."""
-    try:
-        params = {"assets": assets, "normalize": str(normalize).lower()}
-        if from_date:
-            params["from"] = from_date
-        
-        response = requests.get(f"{API_BASE_URL}/compare", params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        st.error(f"Failed to fetch comparison: {e}")
-        return None
+def fetch_comparison(assets_str: str, normalize: bool = False, from_date: str = None) -> Optional[Dict]:
+    """Fetch comparison data directly from DB."""
+    async def _fetch():
+        async with get_db_session() as session:
+            symbols = [s.strip().upper() for s in assets_str.split(",")]
+            asset_objs = []
+            for sym in symbols:
+                a = await crud.get_asset_by_symbol(session, sym)
+                if a:
+                    asset_objs.append(a)
+            
+            if not asset_objs:
+                return None
+            
+            from_dt = datetime.fromisoformat(from_date) if from_date else None
+            asset_ids = [a.id for a in asset_objs]
+            all_snapshots = await crud.get_snapshots_for_comparison(session, asset_ids, from_dt)
+            
+            # Process data
+            symbol_map = {a.id: a.symbol for a in asset_objs}
+            base_prices = {}
+            timestamp_data = {}
+            
+            for snapshot in all_snapshots:
+                ts_key = snapshot.timestamp.isoformat()
+                if ts_key not in timestamp_data:
+                    timestamp_data[ts_key] = {}
+                
+                symbol = symbol_map[snapshot.asset_id]
+                price = float(snapshot.price_usd)
+                
+                if symbol not in base_prices:
+                    base_prices[symbol] = price
+                
+                if normalize and base_prices[symbol] != 0:
+                    price = ((price - base_prices[symbol]) / base_prices[symbol]) * 100
+                    
+                timestamp_data[ts_key][symbol] = price
+            
+            comparison_data = [
+                {"timestamp": ts, "prices": prices}
+                for ts, prices in sorted(timestamp_data.items())
+            ]
+            
+            return {
+                "assets": [a.symbol for a in asset_objs],
+                "data": comparison_data
+            }
+    return run_async(_fetch())
 
 
 @st.cache_data(ttl=60)
-def fetch_anomalies(asset: str, threshold: float = 2.5) -> List[Dict]:
-    """Fetch anomalies for an asset."""
-    try:
-        response = requests.get(
-            f"{API_BASE_URL}/anomalies",
-            params={"asset": asset, "threshold": threshold},
-            timeout=10
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        st.error(f"Failed to fetch anomalies: {e}")
-        return []
+def fetch_anomalies(asset_symbol: str, threshold: float = 2.5) -> List[Dict]:
+    """Detect anomalies locally."""
+    async def _fetch():
+        async with get_db_session() as session:
+            asset = await crud.get_asset_by_symbol(session, asset_symbol)
+            if not asset:
+                return []
+            
+            snapshots = await crud.get_snapshots_by_asset(session, asset.id)
+            anomalies = detect_anomalies(snapshots, threshold, asset_symbol=asset.symbol)
+            
+            return [a.to_dict() for a in anomalies]
+    return run_async(_fetch())
 
 
 @st.cache_data(ttl=60)
-def fetch_volatility(asset: str, window: int = 20) -> List[Dict]:
-    """Fetch volatility data for an asset."""
-    try:
-        response = requests.get(
-            f"{API_BASE_URL}/volatility",
-            params={"asset": asset, "window": window},
-            timeout=10
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        st.error(f"Failed to fetch volatility: {e}")
-        return []
+def fetch_volatility(asset_symbol: str, window: int = 20) -> List[Dict]:
+    """Calculate volatility locally."""
+    async def _fetch():
+        async with get_db_session() as session:
+            asset = await crud.get_asset_by_symbol(session, asset_symbol)
+            if not asset:
+                return []
+            
+            snapshots = await crud.get_snapshots_by_asset(session, asset.id)
+            return calculate_volatility(snapshots, window)
+    return run_async(_fetch())
 
 
 # ============== Enhanced Chart Functions ==============
@@ -883,15 +952,20 @@ def main():
     st.sidebar.markdown("## ⚙️ Dashboard Controls")
     
     # Fetch available assets
-    assets = fetch_assets()
+    with st.spinner("Connecting to crypto network..."):
+        assets = fetch_assets()
     
     if not assets:
-        st.warning("⚠️ No assets available. Make sure the API server is running.")
-        st.code("python -m app.main", language="bash")
+        st.warning("⚠️ No assets available. Initializing database...")
         return
     
     asset_options = {f"{a['symbol']} - {a['name']}": a['symbol'] for a in assets}
     
+    # Check if assets list is empty (can happen on fresh init)
+    if not asset_options:
+         st.info("Initializing system... Please wait a moment and refresh.")
+         return
+         
     # Asset selector
     st.sidebar.markdown("### 🪙 Select Asset")
     selected_display = st.sidebar.selectbox(
