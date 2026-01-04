@@ -5,39 +5,52 @@ from typing import Any, Coroutine
 import threading
 
 import streamlit as st
-import nest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import init_db, get_session
 from app.core.scheduler import start_ingestion, stop_ingestion
 
-# Apply nest_asyncio to allow nested event loops (Streamlit -> asyncio.run)
-nest_asyncio.apply()
-
 logger = logging.getLogger(__name__)
 
 def run_async(coro: Coroutine[Any, Any, Any]) -> Any:
     """
-    Run an async coroutine synchronously.
+    Run an async coroutine synchronously in a separate thread.
     
-    This is necessary because Streamlit runs in a separate thread/loop 
-    and we need to block for the result of backend operations.
+    This avoids conflicts with Streamlit's internal event loop (especially on Cloud 
+    where uvloop might be used) by creating a fresh loop in a dedicated thread.
     """
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    result = []
+    error = []
+
+    def _target():
+        try:
+            # Create a new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Run the coroutine
+            res = loop.run_until_complete(coro)
+            result.append(res)
+            
+            # Clean up
+            loop.close()
+        except Exception as e:
+            error.append(e)
+
+    # Start thread
+    t = threading.Thread(target=_target)
+    t.start()
+    t.join()
+
+    if error:
+        raise error[0]
         
-    return loop.run_until_complete(coro)
+    return result[0] if result else None
 
 @st.cache_resource
 def initialize_backend():
     """
     Initialize the DB and Scheduler once.
-    
-    This function uses st.cache_resource to ensure it only runs once
-    per Streamlit server session, not on every script rerun.
     """
     logger.info("Initializing monolithic backend...")
     
@@ -45,11 +58,13 @@ def initialize_backend():
         await init_db()
         await start_ingestion()
         
-    run_async(_init())
-    logger.info("Backend initialized.")
+    try:
+        run_async(_init())
+        logger.info("Backend initialized.")
+    except Exception as e:
+        logger.error(f"Failed to initialize backend: {e}")
+        st.error(f"Backend initialization failed: {e}")
 
 def get_db_session() -> AsyncSession:
     """Get a database session generator."""
-    # Note: In a real async-to-sync bridge, handling the session context properly is tricky.
-    # We'll use a helper that yields the session for a context manager.
     return get_session()
