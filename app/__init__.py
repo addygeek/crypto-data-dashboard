@@ -1,0 +1,1 @@
+"""Crypto Dashboard Application Package."""
